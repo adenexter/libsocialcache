@@ -62,14 +62,67 @@ void AbstractImageDownloaderPrivate::manageStack()
     Q_Q(AbstractImageDownloader);
     while (runningReplies.count() < MAX_SIMULTANEOUS_DOWNLOAD && !stack.isEmpty()) {
         // Create a reply to download the image
-        ImageInfo data = stack.takeFirst();
+        ImageInfo *info = stack.takeLast();
 
-        QNetworkReply *reply = q->createReply(data.first, data.second);
-        connect(reply, &QNetworkReply::finished,
-                this, &AbstractImageDownloaderPrivate::slotFinished);
-        runningReplies.insert(reply, data);
+        info->file.setFileName(q->outputFile(info->url, info->data));
+
+        QDir parentDir = QFileInfo(info->file.fileName()).dir();
+        if (!parentDir.exists()) {
+            parentDir.mkpath(".");
+        }
+
+        if (info->file.open(QIODevice::ReadWrite)) {
+            QNetworkReply *reply = q->createReply(info->url, info->data);
+            reply->setReadBufferSize(250000);
+
+            connect(reply, &QIODevice::readyRead, this, &AbstractImageDownloaderPrivate::readyRead);
+            connect(reply, &QNetworkReply::finished,
+                    this, &AbstractImageDownloaderPrivate::slotFinished);
+
+            runningReplies.insert(reply, info);
+        } else {
+            qWarning() << Q_FUNC_INFO << "Failed to open file for write" << info->file.errorString();
+            delete info;
+        }
     }
 }
+
+static void readData(ImageInfo *info, QNetworkReply *reply)
+{
+    qint64 size = info->file.size();
+    qint64 bytesAvailable = reply->bytesAvailable();
+    if (bytesAvailable == 0)
+        return;
+
+    info->file.resize(size + bytesAvailable);
+    if (uchar *fileData = info->file.map(size, bytesAvailable)) {
+        char *buffer = reinterpret_cast<char *>(fileData);
+        while (bytesAvailable > 0) {
+            qint64 bytesRead = reply->read(buffer, bytesAvailable);
+            bytesAvailable -= bytesRead;
+            buffer += bytesRead;
+
+            if (bytesRead > 0) {
+                break;
+            }
+        }
+        info->file.unmap(fileData);
+    }
+}
+
+void AbstractImageDownloaderPrivate::readyRead()
+{
+    QNetworkReply *reply = qobject_cast<QNetworkReply *>(sender());
+    if (!reply) {
+        return;
+    }
+
+    ImageInfo *info = runningReplies.value(reply);
+    if (info) {
+        readData(info, reply);
+    }
+}
+
 
 void AbstractImageDownloaderPrivate::slotFinished()
 {
@@ -79,40 +132,23 @@ void AbstractImageDownloaderPrivate::slotFinished()
         return;
     }
 
-    const ImageInfo &data = runningReplies.value(reply);
-    runningReplies.remove(reply);
-
-    QImage image;
-    bool loadedOk = image.loadFromData(reply->readAll());
-    reply->deleteLater();
-    if (!loadedOk || image.isNull()) {
-        qWarning() << Q_FUNC_INFO << "Data downloaded from" << data.first
-                   << "is not an image";
+    ImageInfo *info = runningReplies.take(reply);
+    if (!info) {
         return;
     }
 
-    // Save the new image (eg fbphotoid-thumb.jpg or fbphotoid-image.jpg)
-    QString file = q->outputFile(data.first, data.second);
-    if (file.isEmpty()) {
-        qWarning() << Q_FUNC_INFO << "Output file is not valid";
-        return;
-    }
+    readData(info, reply);
 
-    QDir parentDir = QFileInfo(file).dir();
-    if (!parentDir.exists()) {
-        QDir::root().mkpath(parentDir.absolutePath());
-    }
+    const QString fileName = info->file.fileName();
 
-    bool saveOk = image.save(file);
-    if (!saveOk) {
-        qWarning() << Q_FUNC_INFO << "Cannot save image downloaded from" << data.first;
-        return;
-    }
+    info->file.close();
 
-    q->dbQueueImage(data.first, data.second, file);
+    q->dbQueueImage(info->url, info->data, fileName);
 
     // Emit signal
-    emit q->imageDownloaded(data.first, file, data.second);
+    emit q->imageDownloaded(info->url, fileName, info->data);
+
+    delete info;
 
     loadedCount ++;
     manageStack();
@@ -143,12 +179,26 @@ void AbstractImageDownloader::queue(const QString &url, const QVariantMap &metad
         return;
     }
 
-    ImageInfo info = ImageInfo(url, metadata);
-    if (d->stack.contains(info)) {
-        d->stack.removeAll(info);
+
+    foreach (ImageInfo *info, d->runningReplies) {
+        if (info->url == url) {
+            return;
+        }
     }
 
-    d->stack.prepend(info);
+    ImageInfo *info = 0;
+    for (int i = 0; i < d->stack.count(); ++i) {
+        if (d->stack.at(i)->url == url) {
+            info = d->stack.takeAt(i);
+            break;
+        }
+    }
+
+    if (!info) {
+        info = new ImageInfo(url, metadata);
+    }
+
+    d->stack.append(info);
     d->manageStack();
 }
 
